@@ -31,7 +31,7 @@
 #include <inttypes.h>
 #include "bootutil/fault_injection_hardening.h"
 #include "bootutil/bootutil_public.h"
-
+#include <stdbool.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -82,8 +82,15 @@ fih_int boot_go(struct boot_rsp *rsp);
 fih_int boot_go_for_image_id(struct boot_rsp *rsp, uint32_t image_id);
 
 struct boot_loader_state;
+struct boot_status;
 void boot_state_clear(struct boot_loader_state *state);
+int boot_read_image_headers(struct boot_loader_state *state, bool require_all,
+        struct boot_status *bs);
 fih_int context_boot_go(struct boot_loader_state *state, struct boot_rsp *rsp);
+fih_int boot_image_check(struct boot_loader_state *state, struct image_header *hdr,
+                 const struct flash_area *fap, struct boot_status *bs);
+void boot_status_reset(struct boot_status *bs);
+int boot_check_header_erased(struct boot_loader_state *state, int slot);
 
 #define SPLIT_GO_OK                 (0)
 #define SPLIT_GO_NON_MATCHING       (-1)

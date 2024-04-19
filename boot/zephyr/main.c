@@ -549,6 +549,10 @@ void main(void)
     BOOT_LOG_INF("Starting Direct-XIP bootloader");
 #endif
 
+#if !defined(CONFIG_SERVER_SIGNING)
+BOOT_LOG_WRN("***** Warning : Currently local signing is used which is not recommended for production. Enable server signing *****");
+#endif
+
 #ifdef CONFIG_MCUBOOT_INDICATION_LED
     /* LED init */
     led_init();
