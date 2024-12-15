@@ -47,9 +47,14 @@ config BOOT_SERIAL_CDC_ACM
 
 endchoice
 
+DT_COMPAT_SIM_FLASH:= zephyr,sim-flash
+DT_SIM_FLASH_PATH := $(dt_nodelabel_path,flash_sim0)
+
 config MCUBOOT_SERIAL_DIRECT_IMAGE_UPLOAD
 	bool "Allow to select image number for DFU"
-	depends on !SINGLE_APPLICATION_SLOT
+	# Allow this option to be selected in cases where support for direct uploading to nRF5340
+	# network core should be supported
+	depends on !SINGLE_APPLICATION_SLOT || (SINGLE_APPLICATION_SLOT && SOC_NRF5340_CPUAPP && BOOT_IMAGE_ACCESS_HOOK_NRF5340 && FLASH_SIMULATOR && $(dt_compat_enabled,$(DT_COMPAT_SIM_FLASH)))
 	help
 	  With the option enabled, the mcuboot serial recovery will
 	  respect the "image" field in mcumgr image update frame
@@ -98,7 +103,7 @@ config BOOT_SERIAL_MAX_RECEIVE_SIZE
 
 config BOOT_ERASE_PROGRESSIVELY
 	bool "Erase flash progressively when receiving new firmware"
-	default y if SOC_FAMILY_NRF
+	default y if SOC_FAMILY_NORDIC_NRF
 	help
 	 If enabled, flash is erased as necessary when receiving new firmware,
 	 instead of erasing the whole image slot at once. This is necessary
@@ -201,5 +206,12 @@ config BOOT_SERIAL_IMG_GRP_IMAGE_STATE
 	help
 	  If y, image states will be included with image lists and the set
 	  state command can be used to mark an image as test/confirmed.
+
+config BOOT_SERIAL_IMG_GRP_SLOT_INFO
+	bool "Slot info"
+	default y if UPDATEABLE_IMAGE_NUMBER > 1
+	help
+	  If y, will include the slot info command which lists what available
+	  slots there are in the system.
 
 endif # MCUBOOT_SERIAL

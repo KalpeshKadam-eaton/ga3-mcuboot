@@ -3,7 +3,7 @@
  *
  * Copyright (c) 2017-2019 Linaro LTD
  * Copyright (c) 2016-2019 JUUL Labs
- * Copyright (c) 2019-2023 Arm Limited
+ * Copyright (c) 2019-2024 Arm Limited
  *
  * Original license:
  *
@@ -40,6 +40,15 @@
 
 #include "mcuboot_config/mcuboot_config.h"
 
+#if defined(MCUBOOT_DECOMPRESS_IMAGES)
+#include <nrf_compress/implementation.h>
+#include <compression/decompression.h>
+#endif
+
+#include "bootutil/bootutil_log.h"
+
+BOOT_LOG_MODULE_DECLARE(mcuboot);
+
 #ifdef MCUBOOT_ENC_IMAGES
 #include "bootutil/enc_key.h"
 #endif
@@ -56,6 +65,7 @@
 
 #include "bootutil_priv.h"
 
+#ifndef MCUBOOT_SIGN_PURE
 /*
  * Compute SHA hash over the image.
  * (SHA384 if ECDSA-P384 is being used,
@@ -68,13 +78,15 @@ bootutil_img_hash(struct enc_key_data *enc_state, int image_index,
                   uint8_t *seed, int seed_len)
 {
     bootutil_sha_context sha_ctx;
-    uint32_t blk_sz;
     uint32_t size;
     uint16_t hdr_size;
-    uint32_t off;
-    int rc;
     uint32_t blk_off;
     uint32_t tlv_off;
+#if !defined(MCUBOOT_HASH_STORAGE_DIRECTLY)
+    int rc;
+    uint32_t off;
+    uint32_t blk_sz;
+#endif
 
 #if (BOOT_IMAGE_NUMBER == 1) || !defined(MCUBOOT_ENC_IMAGES) || \
     defined(MCUBOOT_RAM_LOAD)
@@ -96,7 +108,7 @@ bootutil_img_hash(struct enc_key_data *enc_state, int image_index,
 #ifdef MCUBOOT_ENC_IMAGES
     /* Encrypted images only exist in the secondary slot */
     if (MUST_DECRYPT(fap, image_index, hdr) &&
-            !boot_enc_valid(enc_state, image_index, fap)) {
+            !boot_enc_valid(enc_state, 1)) {
         return -1;
     }
 #endif
@@ -117,6 +129,12 @@ bootutil_img_hash(struct enc_key_data *enc_state, int image_index,
     /* If protected TLVs are present they are also hashed. */
     size += hdr->ih_protect_tlv_size;
 
+#ifdef MCUBOOT_HASH_STORAGE_DIRECTLY
+    /* No chunk loading, storage is mapped to address space and can
+     * be directly given to hashing function.
+     */
+    bootutil_sha_update(&sha_ctx, (void *)flash_area_get_off(fap), size);
+#else /* MCUBOOT_HASH_STORAGE_DIRECTLY */
 #ifdef MCUBOOT_RAM_LOAD
     bootutil_sha_update(&sha_ctx,
                         (void*)(IMAGE_RAM_BASE + hdr->ih_load_addr),
@@ -148,21 +166,26 @@ bootutil_img_hash(struct enc_key_data *enc_state, int image_index,
 #ifdef MCUBOOT_ENC_IMAGES
         if (MUST_DECRYPT(fap, image_index, hdr)) {
             /* Only payload is encrypted (area between header and TLVs) */
+            int slot = flash_area_id_to_multi_image_slot(image_index,
+                            flash_area_get_id(fap));
+
             if (off >= hdr_size && off < tlv_off) {
                 blk_off = (off - hdr_size) & 0xf;
-                boot_encrypt(enc_state, image_index, fap, off - hdr_size,
-                        blk_sz, blk_off, tmp_buf);
+                boot_enc_decrypt(enc_state, slot, off - hdr_size,
+                                 blk_sz, blk_off, tmp_buf);
             }
         }
 #endif
         bootutil_sha_update(&sha_ctx, tmp_buf, blk_sz);
     }
 #endif /* MCUBOOT_RAM_LOAD */
+#endif /* MCUBOOT_HASH_STORAGE_DIRECTLY */
     bootutil_sha_finish(&sha_ctx, hash_result);
     bootutil_sha_drop(&sha_ctx);
 
     return 0;
 }
+#endif
 
 /*
  * Currently, we only support being able to verify one type of
@@ -201,7 +224,28 @@ bootutil_img_hash(struct enc_key_data *enc_state, int image_index,
 #    define SIG_BUF_SIZE 32 /* no signing, sha256 digest only */
 #endif
 
+#if (defined(MCUBOOT_HW_KEY)       + \
+     defined(MCUBOOT_BUILTIN_KEY)) > 1
+#error "Please use either MCUBOOT_HW_KEY or the MCUBOOT_BUILTIN_KEY feature."
+#endif
+
 #ifdef EXPECTED_SIG_TLV
+
+#if !defined(MCUBOOT_BUILTIN_KEY)
+#if !defined(MCUBOOT_HW_KEY)
+/* The key TLV contains the hash of the public key. */
+#   define EXPECTED_KEY_TLV     IMAGE_TLV_KEYHASH
+#   define KEY_BUF_SIZE         IMAGE_HASH_SIZE
+#else
+/* The key TLV contains the whole public key.
+ * Add a few extra bytes to the key buffer size for encoding and
+ * for public exponent.
+ */
+#   define EXPECTED_KEY_TLV     IMAGE_TLV_PUBKEY
+#   define KEY_BUF_SIZE         (SIG_BUF_SIZE + 24)
+#endif /* !MCUBOOT_HW_KEY */
+
+#if !defined(CONFIG_BOOT_SIGNATURE_USING_KMU)
 #if !defined(MCUBOOT_HW_KEY)
 static int
 bootutil_find_key(uint8_t *keyhash, uint8_t keyhash_len)
@@ -228,7 +272,7 @@ bootutil_find_key(uint8_t *keyhash, uint8_t keyhash_len)
     bootutil_sha_drop(&sha_ctx);
     return -1;
 }
-#else
+#else /* !MCUBOOT_HW_KEY */
 extern unsigned int pub_key_len;
 static int
 bootutil_find_key(uint8_t image_index, uint8_t *key, uint16_t key_len)
@@ -266,7 +310,9 @@ bootutil_find_key(uint8_t image_index, uint8_t *key, uint16_t key_len)
     return -1;
 }
 #endif /* !MCUBOOT_HW_KEY */
-#endif
+#endif /* !MCUBOOT_BUILTIN_KEY */
+#endif /* !defined(CONFIG_BOOT_SIGNATURE_USING_KMU) */
+#endif /* EXPECTED_SIG_TLV */
 
 /**
  * Reads the value of an image's security counter.
@@ -328,6 +374,71 @@ bootutil_get_img_security_cnt(struct image_header *hdr,
     return 0;
 }
 
+#if defined(MCUBOOT_SIGN_PURE)
+/* Returns:
+ *  0 -- found
+ *  1 -- not found or found but not true
+ * -1 -- failed for some reason
+ *
+ * Value of TLV does not matter, presence decides.
+ */
+static int bootutil_check_for_pure(const struct image_header *hdr,
+                                   const struct flash_area *fap)
+{
+    struct image_tlv_iter it;
+    uint32_t off;
+    uint16_t len;
+    int32_t rc;
+
+    rc = bootutil_tlv_iter_begin(&it, hdr, fap, IMAGE_TLV_SIG_PURE, false);
+    if (rc) {
+        return rc;
+    }
+
+    /* Search for the TLV */
+    rc = bootutil_tlv_iter_next(&it, &off, &len, NULL);
+    if (rc == 0 && len == 1) {
+        bool val;
+
+        rc = LOAD_IMAGE_DATA(hdr, fap, off, &val, 1);
+        if (rc == 0) {
+            rc = !val;
+        }
+    }
+
+    return rc;
+}
+#endif
+
+
+#ifndef ALLOW_ROGUE_TLVS
+/*
+ * The following list of TLVs are the only entries allowed in the unprotected
+ * TLV section.  All other TLV entries must be in the protected section.
+ */
+static const uint16_t allowed_unprot_tlvs[] = {
+     IMAGE_TLV_KEYHASH,
+     IMAGE_TLV_PUBKEY,
+     IMAGE_TLV_SHA256,
+     IMAGE_TLV_SHA384,
+     IMAGE_TLV_SHA512,
+     IMAGE_TLV_RSA2048_PSS,
+     IMAGE_TLV_ECDSA224,
+     IMAGE_TLV_ECDSA_SIG,
+     IMAGE_TLV_RSA3072_PSS,
+     IMAGE_TLV_ED25519,
+#if defined(MCUBOOT_SIGN_PURE)
+     IMAGE_TLV_SIG_PURE,
+#endif
+     IMAGE_TLV_ENC_RSA2048,
+     IMAGE_TLV_ENC_KW,
+     IMAGE_TLV_ENC_EC256,
+     IMAGE_TLV_ENC_X25519,
+     /* Mark end with ANY. */
+     IMAGE_TLV_ANY,
+};
+#endif
+
 /*
  * Verify the integrity of the image.
  * Return non-zero if image could not be validated/does not validate.
@@ -341,18 +452,26 @@ bootutil_img_validate(struct enc_key_data *enc_state, int image_index,
     uint32_t off;
     uint16_t len;
     uint16_t type;
-    int image_hash_valid = 0;
 #ifdef EXPECTED_SIG_TLV
     FIH_DECLARE(valid_signature, FIH_FAILURE);
+#ifndef MCUBOOT_BUILTIN_KEY
     int key_id = -1;
+#else
+    /* Pass a key ID equal to the image index, the underlying crypto library
+     * is responsible for mapping the image index to a builtin key ID.
+     */
+    int key_id = image_index;
+#endif /* !MCUBOOT_BUILTIN_KEY */
 #ifdef MCUBOOT_HW_KEY
-    /* Few extra bytes for encoding and for public exponent. */
-    uint8_t key_buf[SIG_BUF_SIZE + 24];
+    uint8_t key_buf[KEY_BUF_SIZE];
 #endif
 #endif /* EXPECTED_SIG_TLV */
     struct image_tlv_iter it;
     uint8_t buf[SIG_BUF_SIZE];
+#if defined(EXPECTED_HASH_TLV) && !defined(MCUBOOT_SIGN_PURE)
+    int image_hash_valid = 0;
     uint8_t hash[IMAGE_HASH_SIZE];
+#endif
     int rc = 0;
     FIH_DECLARE(fih_rc, FIH_FAILURE);
 #ifdef MCUBOOT_HW_ROLLBACK_PROT
@@ -361,6 +480,69 @@ bootutil_img_validate(struct enc_key_data *enc_state, int image_index,
     FIH_DECLARE(security_counter_valid, FIH_FAILURE);
 #endif
 
+#ifdef MCUBOOT_DECOMPRESS_IMAGES
+    /* If the image is compressed, the integrity of the image must also be validated */
+    if (MUST_DECOMPRESS(fap, image_index, hdr)) {
+        bool found_decompressed_size = false;
+        bool found_decompressed_sha = false;
+        bool found_decompressed_signature = false;
+
+        rc = bootutil_tlv_iter_begin(&it, hdr, fap, IMAGE_TLV_ANY, true);
+        if (rc) {
+            goto out;
+        }
+
+        if (it.tlv_end > bootutil_max_image_size(fap)) {
+            rc = -1;
+            goto out;
+        }
+
+        while (true) {
+            uint16_t expected_size = 0;
+            bool *found_flag = NULL;
+
+            rc = bootutil_tlv_iter_next(&it, &off, &len, &type);
+            if (rc < 0) {
+                goto out;
+            } else if (rc > 0) {
+                break;
+            }
+
+            switch (type) {
+            case IMAGE_TLV_DECOMP_SIZE:
+                expected_size = sizeof(size_t);
+                found_flag = &found_decompressed_size;
+                break;
+            case IMAGE_TLV_DECOMP_SHA:
+                expected_size = IMAGE_HASH_SIZE;
+                found_flag = &found_decompressed_sha;
+                break;
+            case IMAGE_TLV_DECOMP_SIGNATURE:
+                found_flag = &found_decompressed_signature;
+                break;
+            default:
+                continue;
+            };
+
+            if (type == IMAGE_TLV_DECOMP_SIGNATURE && !EXPECTED_SIG_LEN(len)) {
+                rc = -1;
+                goto out;
+            } else if (type != IMAGE_TLV_DECOMP_SIGNATURE && len != expected_size) {
+                rc = -1;
+                goto out;
+            }
+
+            *found_flag = true;
+        }
+
+        rc = (!found_decompressed_size || !found_decompressed_sha || !found_decompressed_signature);
+        if (rc) {
+            goto out;
+        }
+    }
+#endif
+
+#if defined(EXPECTED_HASH_TLV) && !defined(MCUBOOT_SIGN_PURE)
     rc = bootutil_img_hash(enc_state, image_index, hdr, fap, tmp_buf,
             tmp_buf_sz, hash, seed, seed_len);
     if (rc) {
@@ -370,6 +552,15 @@ bootutil_img_validate(struct enc_key_data *enc_state, int image_index,
     if (out_hash) {
         memcpy(out_hash, hash, IMAGE_HASH_SIZE);
     }
+#endif
+
+#if defined(MCUBOOT_SIGN_PURE)
+    /* If Pure type signature is expected then it has to be there */
+    rc = bootutil_check_for_pure(hdr, fap);
+    if (rc != 0) {
+	goto out;
+    }
+#endif
 
     rc = bootutil_tlv_iter_begin(&it, hdr, fap, IMAGE_TLV_ANY, false);
     if (rc) {
@@ -393,7 +584,30 @@ bootutil_img_validate(struct enc_key_data *enc_state, int image_index,
             break;
         }
 
-        if (type == EXPECTED_HASH_TLV) {
+#ifndef ALLOW_ROGUE_TLVS
+        /*
+         * Ensure that the non-protected TLV only has entries necessary to hold
+         * the signature.  We also allow encryption related keys to be in the
+         * unprotected area.
+         */
+        if (!bootutil_tlv_iter_is_prot(&it, off)) {
+             bool found = false;
+             for (const uint16_t *p = allowed_unprot_tlvs; *p != IMAGE_TLV_ANY; p++) {
+                  if (type == *p) {
+                       found = true;
+                       break;
+                  }
+             }
+             if (!found) {
+                  FIH_SET(fih_rc, FIH_FAILURE);
+                  goto out;
+             }
+        }
+#endif
+        switch(type) {
+#if defined(EXPECTED_HASH_TLV) && !defined(MCUBOOT_SIGN_PURE)
+        case EXPECTED_HASH_TLV:
+        {
             /* Verify the image hash. This must always be present. */
             if (len != sizeof(hash)) {
                 rc = -1;
@@ -411,50 +625,51 @@ bootutil_img_validate(struct enc_key_data *enc_state, int image_index,
             }
 
             image_hash_valid = 1;
-#ifdef EXPECTED_SIG_TLV
-#ifndef MCUBOOT_HW_KEY
-        } else if (type == IMAGE_TLV_KEYHASH) {
+            break;
+        }
+#endif /* defined(EXPECTED_HASH_TLV) && !defined(MCUBOOT_SIGN_PURE) */
+#if !defined(CONFIG_BOOT_SIGNATURE_USING_KMU)
+#ifdef EXPECTED_KEY_TLV
+        case EXPECTED_KEY_TLV:
+        {
             /*
              * Determine which key we should be checking.
              */
-            if (len > IMAGE_HASH_SIZE) {
+            if (len > KEY_BUF_SIZE) {
                 rc = -1;
                 goto out;
             }
+#ifndef MCUBOOT_HW_KEY
             rc = LOAD_IMAGE_DATA(hdr, fap, off, buf, len);
             if (rc) {
                 goto out;
             }
             key_id = bootutil_find_key(buf, len);
-            /*
-             * The key may not be found, which is acceptable.  There
-             * can be multiple signatures, each preceded by a key.
-             */
 #else
-        } else if (type == IMAGE_TLV_PUBKEY) {
-            /*
-             * Determine which key we should be checking.
-             */
-            if (len > sizeof(key_buf)) {
-                rc = -1;
-                goto out;
-            }
             rc = LOAD_IMAGE_DATA(hdr, fap, off, key_buf, len);
             if (rc) {
                 goto out;
             }
             key_id = bootutil_find_key(image_index, key_buf, len);
+#endif /* !MCUBOOT_HW_KEY */
             /*
              * The key may not be found, which is acceptable.  There
              * can be multiple signatures, each preceded by a key.
              */
-#endif /* !MCUBOOT_HW_KEY */
-        } else if (type == EXPECTED_SIG_TLV) {
+            break;
+        }
+#endif /* EXPECTED_KEY_TLV */
+#endif /* !defined(CONFIG_BOOT_SIGNATURE_USING_KMU) */
+#ifdef EXPECTED_SIG_TLV
+        case EXPECTED_SIG_TLV:
+        {
+#if !defined(CONFIG_BOOT_SIGNATURE_USING_KMU)
             /* Ignore this signature if it is out of bounds. */
             if (key_id < 0 || key_id >= bootutil_key_cnt) {
                 key_id = -1;
                 continue;
             }
+#endif /* !defined(CONFIG_BOOT_SIGNATURE_USING_KMU) */
             if (!EXPECTED_SIG_LEN(len) || len > sizeof(buf)) {
                 rc = -1;
                 goto out;
@@ -463,12 +678,25 @@ bootutil_img_validate(struct enc_key_data *enc_state, int image_index,
             if (rc) {
                 goto out;
             }
+#ifndef MCUBOOT_SIGN_PURE
             FIH_CALL(bootutil_verify_sig, valid_signature, hash, sizeof(hash),
                                                            buf, len, key_id);
+#else
+            /* Directly check signature on the image, by using the mapping of
+             * a device to memory. The pointer is beginning of image in flash,
+             * so offset of area, the range is header + image + protected tlvs.
+             */
+            FIH_CALL(bootutil_verify_img, valid_signature, (void *)flash_area_get_off(fap),
+                     hdr->ih_hdr_size + hdr->ih_img_size + hdr->ih_protect_tlv_size,
+                     buf, len, key_id);
+#endif
             key_id = -1;
+            break;
+        }
 #endif /* EXPECTED_SIG_TLV */
 #ifdef MCUBOOT_HW_ROLLBACK_PROT
-        } else if (type == IMAGE_TLV_SEC_CNT) {
+        case IMAGE_TLV_SEC_CNT:
+        {
             /*
              * Verify the image's security counter.
              * This must always be present.
@@ -503,14 +731,21 @@ bootutil_img_validate(struct enc_key_data *enc_state, int image_index,
 
             /* The image's security counter has been successfully verified. */
             security_counter_valid = fih_rc;
+            break;
+        }
 #endif /* MCUBOOT_HW_ROLLBACK_PROT */
         }
     }
 
+#if defined(EXPECTED_HASH_TLV) && !defined(MCUBOOT_SIGN_PURE)
     rc = !image_hash_valid;
     if (rc) {
         goto out;
     }
+#elif defined(MCUBOOT_SIGN_PURE)
+    /* This returns true on EQ, rc is err on non-0 */
+    rc = FIH_NOT_EQ(valid_signature, FIH_SUCCESS);
+#endif
 #ifdef EXPECTED_SIG_TLV
     FIH_SET(fih_rc, valid_signature);
 #endif
@@ -519,6 +754,163 @@ bootutil_img_validate(struct enc_key_data *enc_state, int image_index,
         rc = -1;
         goto out;
     }
+#endif
+
+#ifdef MCUBOOT_DECOMPRESS_IMAGES
+    /* Only after all previous verifications have passed, perform a dry-run of the decompression
+     * and ensure the image is valid
+     */
+    if (!rc && MUST_DECOMPRESS(fap, image_index, hdr)) {
+        image_hash_valid = 0;
+        FIH_SET(valid_signature, FIH_FAILURE);
+
+        rc = bootutil_img_hash_decompress(enc_state, image_index, hdr, fap, tmp_buf, tmp_buf_sz,
+                                          hash, seed, seed_len);
+        if (rc) {
+            goto out;
+        }
+
+        rc = bootutil_tlv_iter_begin(&it, hdr, fap, IMAGE_TLV_DECOMP_SHA, true);
+        if (rc) {
+            goto out;
+        }
+
+        if (it.tlv_end > bootutil_max_image_size(fap)) {
+            rc = -1;
+            goto out;
+        }
+
+        while (true) {
+            rc = bootutil_tlv_iter_next(&it, &off, &len, &type);
+            if (rc < 0) {
+                goto out;
+            } else if (rc > 0) {
+                break;
+            }
+
+            if (type == IMAGE_TLV_DECOMP_SHA) {
+                /* Verify the image hash. This must always be present. */
+                if (len != sizeof(hash)) {
+                    rc = -1;
+                    goto out;
+                }
+                rc = LOAD_IMAGE_DATA(hdr, fap, off, buf, sizeof(hash));
+                if (rc) {
+                    goto out;
+                }
+
+                FIH_CALL(boot_fih_memequal, fih_rc, hash, buf, sizeof(hash));
+                if (FIH_NOT_EQ(fih_rc, FIH_SUCCESS)) {
+                    FIH_SET(fih_rc, FIH_FAILURE);
+                    goto out;
+                }
+
+                image_hash_valid = 1;
+            }
+        }
+
+        rc = !image_hash_valid;
+        if (rc) {
+            goto out;
+        }
+
+#ifdef EXPECTED_SIG_TLV
+#if !defined(CONFIG_BOOT_SIGNATURE_USING_KMU) && defined(EXPECTED_KEY_TLV)
+        rc = bootutil_tlv_iter_begin(&it, hdr, fap, EXPECTED_KEY_TLV, false);
+        if (rc) {
+            goto out;
+        }
+
+        if (it.tlv_end > bootutil_max_image_size(fap)) {
+            rc = -1;
+            goto out;
+        }
+
+        while (true) {
+            rc = bootutil_tlv_iter_next(&it, &off, &len, &type);
+            if (rc < 0) {
+                goto out;
+            } else if (rc > 0) {
+                break;
+            }
+
+            if (type == EXPECTED_KEY_TLV) {
+                /*
+                 * Determine which key we should be checking.
+                 */
+                if (len > KEY_BUF_SIZE) {
+                    rc = -1;
+                    goto out;
+                 }
+#ifndef MCUBOOT_HW_KEY
+                rc = LOAD_IMAGE_DATA(hdr, fap, off, buf, len);
+                if (rc) {
+                    goto out;
+                }
+                key_id = bootutil_find_key(buf, len);
+#else
+                rc = LOAD_IMAGE_DATA(hdr, fap, off, key_buf, len);
+                if (rc) {
+                    goto out;
+                }
+                key_id = bootutil_find_key(image_index, key_buf, len);
+#endif /* !MCUBOOT_HW_KEY */
+                /*
+                 * The key may not be found, which is acceptable.  There
+                 * can be multiple signatures, each preceded by a key.
+                 */
+            }
+        }
+#endif /* !CONFIG_BOOT_SIGNATURE_USING_KMU && EXPECTED_KEY_TLV */
+
+        rc = bootutil_tlv_iter_begin(&it, hdr, fap, IMAGE_TLV_DECOMP_SIGNATURE, true);
+        if (rc) {
+            goto out;
+        }
+
+        if (it.tlv_end > bootutil_max_image_size(fap)) {
+            rc = -1;
+            goto out;
+        }
+
+        while (true) {
+            rc = bootutil_tlv_iter_next(&it, &off, &len, &type);
+            if (rc < 0) {
+                goto out;
+            } else if (rc > 0) {
+                rc = 0;
+                break;
+            }
+
+            if (type == IMAGE_TLV_DECOMP_SIGNATURE) {
+                /* Ignore this signature if it is out of bounds. */
+#if !defined(CONFIG_BOOT_SIGNATURE_USING_KMU)
+                if (key_id < 0 || key_id >= bootutil_key_cnt) {
+                    key_id = -1;
+                    continue;
+                }
+#endif
+
+                if (!EXPECTED_SIG_LEN(len) || len > sizeof(buf)) {
+                    rc = -1;
+                    goto out;
+                }
+                rc = LOAD_IMAGE_DATA(hdr, fap, off, buf, len);
+                if (rc) {
+                    goto out;
+                }
+
+                FIH_CALL(bootutil_verify_sig, valid_signature, hash, sizeof(hash),
+                                                               buf, len, key_id);
+                key_id = -1;
+            }
+        }
+#endif /* EXPECTED_SIG_TLV */
+    }
+#endif
+
+#ifdef EXPECTED_SIG_TLV
+    FIH_SET(fih_rc, valid_signature);
 #endif
 
 out:

@@ -27,6 +27,10 @@
 #include <soc.h>
 #include <zephyr/linker/linker-defs.h>
 
+#if defined(CONFIG_BOOT_DISABLE_CACHES)
+#include <zephyr/cache.h>
+#endif
+
 #if defined(CONFIG_ARM)
 #include <cmsis_core.h>
 #endif
@@ -42,10 +46,10 @@
 #include "flash_map_backend/flash_map_backend.h"
 
 /* Check if Espressif target is supported */
-#ifdef CONFIG_SOC_FAMILY_ESP32
+#ifdef CONFIG_SOC_FAMILY_ESPRESSIF_ESP32
 
 #include <bootloader_init.h>
-#include <esp_loader.h>
+#include <esp_image_loader.h>
 
 #define IMAGE_INDEX_0   0
 #define IMAGE_INDEX_1   1
@@ -63,7 +67,7 @@
 #define IMAGE1_PRIMARY_SIZE \
           DT_PROP_BY_IDX(DT_NODE_BY_FIXED_PARTITION_LABEL(image_1), reg, 1)
 
-#endif /* CONFIG_SOC_FAMILY_ESP32 */
+#endif /* CONFIG_SOC_FAMILY_ESPRESSIF_ESP32 */
 
 #ifdef CONFIG_FW_INFO
 #include <fw_info.h>
@@ -192,7 +196,14 @@ static void do_boot(struct boot_rsp *rsp)
 #endif
 
 #if defined(CONFIG_FW_INFO) && !defined(CONFIG_EXT_API_PROVIDE_EXT_API_UNUSED)
-    const struct fw_info *firmware_info = fw_info_find((uint32_t) vt);
+    uintptr_t fw_start_addr;
+
+    rc = flash_device_base(rsp->br_flash_dev_id, &fw_start_addr);
+    assert(rc == 0);
+
+    fw_start_addr += rsp->br_image_off + rsp->br_hdr->ih_hdr_size;
+
+    const struct fw_info *firmware_info = fw_info_find(fw_start_addr);
     bool provided = fw_info_ext_api_provide(firmware_info, true);
 
 #ifdef PM_S0_ADDRESS
@@ -214,10 +225,12 @@ static void do_boot(struct boot_rsp *rsp)
 #if CONFIG_MCUBOOT_CLEANUP_ARM_CORE
     cleanup_arm_nvic(); /* cleanup NVIC registers */
 
-#ifdef CONFIG_CPU_CORTEX_M_HAS_CACHE
-    /* Disable instruction cache and data cache before chain-load the application */
-    SCB_DisableDCache();
-    SCB_DisableICache();
+#if defined(CONFIG_BOOT_DISABLE_CACHES)
+    /* Flush and disable instruction/data caches before chain-loading the application */
+    (void)sys_cache_instr_flush_all();
+    (void)sys_cache_data_flush_all();
+    sys_cache_instr_disable();
+    sys_cache_data_disable();
 #endif
 
 #if CONFIG_CPU_HAS_ARM_MPU || CONFIG_CPU_HAS_NXP_MPU
@@ -258,12 +271,39 @@ static void do_boot(struct boot_rsp *rsp)
     __set_CONTROL(0x00); /* application will configures core on its own */
     __ISB();
 #endif
+#if CONFIG_MCUBOOT_CLEANUP_RAM
+    __asm__ volatile (
+        /* vt->reset -> r0 */
+        "   mov     r0, %0\n"
+        /* base to write -> r1 */
+        "   mov     r1, %1\n"
+        /* size to write -> r2 */
+        "   mov     r2, %2\n"
+        /* value to write -> r3 */
+        "   mov     r3, %3\n"
+        "clear:\n"
+        "   str     r3, [r1]\n"
+        "   add     r1, r1, #4\n"
+        "   sub     r2, r2, #4\n"
+        "   cbz     r2, out\n"
+        "   b       clear\n"
+        "out:\n"
+        "   dsb\n"
+        /* jump to reset vector of an app */
+        "   bx      r0\n"
+        :
+        : "r" (vt->reset), "i" (CONFIG_SRAM_BASE_ADDRESS),
+          "i" (CONFIG_SRAM_SIZE * 1024), "i" (0)
+        : "r0", "r1", "r2", "r3", "memory"
+    );
+#else
     ((void (*)(void))vt->reset)();
+#endif
 }
 
 #elif defined(CONFIG_XTENSA) || defined(CONFIG_RISCV)
 
-#ifndef CONFIG_SOC_FAMILY_ESP32
+#ifndef CONFIG_SOC_FAMILY_ESPRESSIF_ESP32
 
 #define SRAM_BASE_ADDRESS	0xBE030000
 
@@ -292,19 +332,21 @@ static void copy_img_to_SRAM(int slot, unsigned int hdr_offset)
 done:
     flash_area_close(fap);
 }
-#endif /* !CONFIG_SOC_FAMILY_ESP32 */
+#endif /* !CONFIG_SOC_FAMILY_ESPRESSIF_ESP32 */
 
 /* Entry point (.ResetVector) is at the very beginning of the image.
  * Simply copy the image to a suitable location and jump there.
  */
 static void do_boot(struct boot_rsp *rsp)
 {
+#ifndef CONFIG_SOC_FAMILY_ESPRESSIF_ESP32
     void *start;
+#endif /* CONFIG_SOC_FAMILY_ESPRESSIF_ESP32 */
 
     BOOT_LOG_INF("br_image_off = 0x%x\n", rsp->br_image_off);
     BOOT_LOG_INF("ih_hdr_size = 0x%x\n", rsp->br_hdr->ih_hdr_size);
 
-#ifdef CONFIG_SOC_FAMILY_ESP32
+#ifdef CONFIG_SOC_FAMILY_ESPRESSIF_ESP32
     int slot = (rsp->br_image_off == IMAGE0_PRIMARY_START_ADDRESS) ?
                 PRIMARY_SLOT : SECONDARY_SLOT;
     /* Load memory segments and start from entry point */
@@ -316,7 +358,7 @@ static void do_boot(struct boot_rsp *rsp)
     /* Jump to entry point */
     start = (void *)(SRAM_BASE_ADDRESS + rsp->br_hdr->ih_hdr_size);
     ((void (*)(void))start)();
-#endif /* CONFIG_SOC_FAMILY_ESP32 */
+#endif /* CONFIG_SOC_FAMILY_ESPRESSIF_ESP32 */
 }
 
 #else
@@ -551,13 +593,26 @@ int main(void)
          * recovery mode
          */
         boot_serial_enter();
+#elif defined(CONFIG_BOOT_USB_DFU_NO_APPLICATION)
+        rc = usb_enable(NULL);
+        if (rc && rc != -EALREADY) {
+            BOOT_LOG_ERR("Cannot enable USB");
+        } else {
+            BOOT_LOG_INF("Waiting for USB DFU");
+            wait_for_usb_dfu(K_FOREVER);
+        }
 #endif
 
         FIH_PANIC;
     }
 
+#ifdef CONFIG_BOOT_RAM_LOAD
+    BOOT_LOG_INF("Bootloader chainload address offset: 0x%x",
+                 rsp.br_hdr->ih_load_addr);
+#else
     BOOT_LOG_INF("Bootloader chainload address offset: 0x%x",
                  rsp.br_image_off);
+#endif
 
 #if defined(MCUBOOT_DIRECT_XIP)
     BOOT_LOG_INF("Jumping to the image slot");
@@ -588,7 +643,11 @@ int main(void)
     }
 
 #if defined(CONFIG_SOC_NRF5340_CPUAPP) && defined(PM_CPUNET_B0N_ADDRESS) && defined(CONFIG_PCD_APP)
-    pcd_lock_ram();
+#if defined(PM_TFM_SECURE_ADDRESS)
+    pcd_lock_ram(false);
+#else
+    pcd_lock_ram(true);
+#endif
 #endif
 #endif /* USE_PARTITION_MANAGER && CONFIG_FPROTECT */
 

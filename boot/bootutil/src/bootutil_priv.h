@@ -58,8 +58,14 @@ struct flash_area;
      defined(MCUBOOT_SWAP_USING_MOVE) + \
      defined(MCUBOOT_DIRECT_XIP) + \
      defined(MCUBOOT_RAM_LOAD) + \
-     defined(MCUBOOT_FIRMWARE_LOADER)) > 1
+     defined(MCUBOOT_FIRMWARE_LOADER) + \
+     defined(MCUBOOT_SWAP_USING_SCRATCH)) > 1
 #error "Please enable only one of MCUBOOT_OVERWRITE_ONLY, MCUBOOT_SWAP_USING_MOVE, MCUBOOT_DIRECT_XIP, MCUBOOT_RAM_LOAD or MCUBOOT_FIRMWARE_LOADER"
+#endif
+
+#if !defined(MCUBOOT_DIRECT_XIP) && \
+     defined(MCUBOOT_DIRECT_XIP_REVERT)
+#error "MCUBOOT_DIRECT_XIP_REVERT cannot be enabled unless MCUBOOT_DIRECT_XIP is used"
 #endif
 
 #if !defined(MCUBOOT_OVERWRITE_ONLY) && \
@@ -261,6 +267,9 @@ struct boot_loader_state {
 
 fih_ret bootutil_verify_sig(uint8_t *hash, uint32_t hlen, uint8_t *sig,
                             size_t slen, uint8_t key_id);
+
+fih_ret bootutil_verify_img(const uint8_t *img, uint32_t size,
+                            uint8_t *sig, size_t slen, uint8_t key_id);
 
 fih_ret boot_fih_memequal(const void *s1, const void *s2, size_t n);
 

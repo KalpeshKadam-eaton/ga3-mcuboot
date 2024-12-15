@@ -51,6 +51,12 @@ if(EXISTS targets/${BOARD}.h)
   zephyr_library_compile_definitions(MCUBOOT_TARGET_CONFIG="${BOARD}.h")
 endif()
 
+if(DEFINED CONFIG_MBEDTLS)
+  zephyr_library_include_directories(
+    ${ZEPHYR_MBEDTLS_MODULE_DIR}/include
+  )
+endif()
+
 # Zephyr port-specific sources.
 zephyr_library_sources(
   main.c
@@ -102,6 +108,10 @@ zephyr_library_sources(
   ${BOOT_DIR}/bootutil/src/fault_injection_hardening.c
   )
 
+if(DEFINED CONFIG_BOOT_ENCRYPT_X25519 AND DEFINED CONFIG_BOOT_ED25519_PSA)
+  zephyr_library_sources(${BOOT_DIR}/bootutil/src/encrypted_psa.c)
+endif()
+
 if(DEFINED CONFIG_MEASURED_BOOT OR DEFINED CONFIG_BOOT_SHARE_DATA)
   zephyr_library_sources(
     ${BOOT_DIR}/bootutil/src/boot_record.c
@@ -135,13 +145,29 @@ zephyr_library_sources(
   )
 zephyr_library_include_directories(${BOOT_DIR}/bootutil/src)
 else()
+  if(NOT CONFIG_MCUBOOT_APPLICATION_IMAGE_NUMBER EQUAL "-1")
+    # Sysbuild
+    zephyr_library_sources(
+      ${BOOT_DIR}/bootutil/src/loader.c
+    )
+  else()
+    # Legacy child/parent image
+    zephyr_library_sources(
+      ${BOOT_DIR}/bootutil/src/loader_legacy_child_parent.c
+    )
+  endif()
 zephyr_library_sources(
-  ${BOOT_DIR}/bootutil/src/loader.c
   ${BOOT_DIR}/bootutil/src/swap_misc.c
   ${BOOT_DIR}/bootutil/src/swap_scratch.c
   ${BOOT_DIR}/bootutil/src/swap_move.c
   ${BOOT_DIR}/bootutil/src/caps.c
   )
+
+  if(NOT CONFIG_MCUBOOT_MCUBOOT_IMAGE_NUMBER EQUAL "-1" AND NOT CONFIG_BOOT_UPGRADE_ONLY)
+    zephyr_library_sources(
+      ${BOOT_DIR}/bootutil/src/swap_nsib.c
+    )
+  endif()
 endif()
 
 if(CONFIG_BOOT_SIGNATURE_TYPE_ECDSA_P256 OR CONFIG_BOOT_ENCRYPT_EC256)
@@ -230,25 +256,40 @@ elseif(CONFIG_BOOT_SIGNATURE_TYPE_ED25519 OR CONFIG_BOOT_ENCRYPT_X25519)
     ${FIAT_DIR}/include/
   )
 
-  zephyr_library_sources(
-    ${FIAT_DIR}/src/curve25519.c
-  )
+  if(NOT CONFIG_BOOT_ED25519_PSA)
+    zephyr_library_sources(
+      ${FIAT_DIR}/src/curve25519.c
+    )
+  else()
+    zephyr_library_sources(
+      ${MBEDTLS_ASN1_DIR}/src/asn1parse.c
+      ${BOOT_DIR}/bootutil/src/ed25519_psa.c
+    )
+  endif()
 endif()
 
-if(CONFIG_BOOT_ENCRYPT_EC256 OR CONFIG_BOOT_ENCRYPT_X25519)
-  zephyr_library_sources(
-    ${TINYCRYPT_DIR}/source/aes_encrypt.c
-    ${TINYCRYPT_DIR}/source/aes_decrypt.c
-    ${TINYCRYPT_DIR}/source/ctr_mode.c
-    ${TINYCRYPT_DIR}/source/hmac.c
-    ${TINYCRYPT_DIR}/source/ecc_dh.c
+if(NOT CONFIG_BOOT_ED25519_PSA)
+  if(CONFIG_BOOT_ENCRYPT_EC256 OR CONFIG_BOOT_ENCRYPT_X25519)
+    zephyr_library_sources(
+      ${TINYCRYPT_DIR}/source/aes_encrypt.c
+      ${TINYCRYPT_DIR}/source/aes_decrypt.c
+      ${TINYCRYPT_DIR}/source/ctr_mode.c
+      ${TINYCRYPT_DIR}/source/hmac.c
+      ${TINYCRYPT_DIR}/source/ecc_dh.c
     )
+  endif()
 endif()
 
 if(CONFIG_BOOT_ENCRYPT_EC256)
   zephyr_library_sources(
     ${TINYCRYPT_DIR}/source/ecc_dh.c
     )
+endif()
+
+if(CONFIG_BOOT_DECOMPRESSION)
+  zephyr_library_sources(
+    decompression.c
+  )
 endif()
 
 if(CONFIG_MCUBOOT_SERIAL)
@@ -272,7 +313,7 @@ if(CONFIG_MCUBOOT_SERIAL)
   endif()
 endif()
 
-if(NOT CONFIG_BOOT_SIGNATURE_KEY_FILE STREQUAL "")
+if(NOT CONFIG_BOOT_SIGNATURE_USING_KMU AND NOT CONFIG_BOOT_SIGNATURE_KEY_FILE STREQUAL "")
   # CONF_FILE points to the KConfig configuration files of the bootloader.
   foreach (filepath ${CONF_FILE})
     file(READ ${filepath} temp_text)
@@ -364,23 +405,71 @@ zephyr_library_sources(
 )
 endif()
 
-if(SYSBUILD)
-  function(align_up num align result)
-    math(EXPR out "(((${num}) + ((${align}) - 1)) & ~((${align}) - 1))")
-    set(${result} "${out}" PARENT_SCOPE)
-  endfunction()
+if(CONFIG_MCUBOOT_BOOT_BANNER)
+  # Replace Zephyr's boot banner with the MCUboot one
+  zephyr_sources(kernel/banner.c)
+endif()
 
-  function(dt_get_parent node)
-    string(FIND "${${node}}" "/" pos REVERSE)
+function(align_up num align result)
+  math(EXPR out "(((${num}) + ((${align}) - 1)) & ~((${align}) - 1))")
+  set(${result} "${out}" PARENT_SCOPE)
+endfunction()
 
-    if(pos EQUAL -1)
-      message(ERROR "Unable to get parent of node: ${${node}}")
+function(dt_get_parent node)
+  string(FIND "${${node}}" "/" pos REVERSE)
+
+  if(pos EQUAL -1)
+    message(ERROR "Unable to get parent of node: ${${node}}")
+  endif()
+
+  string(SUBSTRING "${${node}}" 0 ${pos} ${node})
+  set(${node} "${${node}}" PARENT_SCOPE)
+endfunction()
+
+if(CONFIG_BOOT_MAX_IMG_SECTORS_AUTO)
+  dt_nodelabel(slot0_flash NODELABEL "slot0_partition")
+  dt_prop(slot0_size PATH "${slot0_flash}" PROPERTY "reg" INDEX 1)
+  dt_get_parent(slot0_flash)
+  dt_get_parent(slot0_flash)
+  dt_prop(erase_size_slot0 PATH "${slot0_flash}" PROPERTY "erase-block-size")
+
+  if(NOT DEFINED slot0_size)
+    message(WARNING "Unable to determine size of slot0 partition, cannot calculate minimum sector usage")
+  elseif(NOT DEFINED erase_size_slot0)
+    message(WARNING "Unable to determine erase size of slot0 partition, cannot calculate minimum sector usage")
+  else()
+    math(EXPR slot_min_sectors "${slot0_size} / ${erase_size_slot0}")
+  endif()
+
+  if(NOT CONFIG_SINGLE_APPLICATION_SLOT)
+    dt_nodelabel(slot1_flash NODELABEL "slot1_partition")
+    dt_prop(slot1_size PATH "${slot1_flash}" PROPERTY "reg" INDEX 1)
+    dt_get_parent(slot1_flash)
+    dt_get_parent(slot1_flash)
+    dt_prop(erase_size_slot1 PATH "${slot1_flash}" PROPERTY "erase-block-size")
+
+    if(NOT DEFINED slot1_size)
+      message(WARNING "Unable to determine size of slot1 partition, cannot calculate minimum sector usage")
+    elseif(NOT DEFINED erase_size_slot1)
+      message(WARNING "Unable to determine erase size of slot1 partition, cannot calculate minimum sector usage")
+    else()
+      math(EXPR slot1_min_sectors "${slot1_size} / ${erase_size_slot1}")
+
+      if("${slot1_min_sectors}" GREATER "${slot_min_sectors}")
+        set(slot_min_sectors ${slot1_min_sectors})
+      endif()
     endif()
+  endif()
 
-    string(SUBSTRING "${${node}}" 0 ${pos} ${node})
-    set(${node} "${${node}}" PARENT_SCOPE)
-  endfunction()
+  if(DEFINED slot_min_sectors AND "${slot_min_sectors}" GREATER "0")
+    zephyr_compile_definitions("MIN_SECTOR_COUNT=${slot_min_sectors}")
+    message("Calculated maximum number of sectors: ${slot_min_sectors}")
+  else()
+    message(WARNING "Unable to calculate minimum number of sector sizes, falling back to 128 sector default. Please disable CONFIG_BOOT_MAX_IMG_SECTORS_AUTO and set CONFIG_BOOT_MAX_IMG_SECTORS to the required value")
+  endif()
+endif()
 
+if(SYSBUILD)
   if(CONFIG_SINGLE_APPLICATION_SLOT OR CONFIG_BOOT_FIRMWARE_LOADER OR CONFIG_BOOT_SWAP_USING_SCRATCH OR CONFIG_BOOT_SWAP_USING_MOVE OR CONFIG_BOOT_UPGRADE_ONLY OR CONFIG_BOOT_DIRECT_XIP OR CONFIG_BOOT_RAM_LOAD)
     # TODO: RAM LOAD support
     dt_nodelabel(slot0_flash NODELABEL "slot0_partition")
@@ -439,8 +528,12 @@ if(SYSBUILD)
     if(NOT DEFINED write_size)
       message(WARNING "Unable to determine write size of slot0 or slot1 partition, setting to 8 (this is probably wrong)")
       set(write_size 8)
-    elseif(write_size LESS 8)
-      set(write_size 8)
+    endif()
+
+    if(${write_size} LESS 8)
+      set(max_align_size 8)
+    else()
+      set(max_align_size ${write_size})
     endif()
 
     set(key_size 0)
@@ -479,7 +572,7 @@ if(SYSBUILD)
         set(key_size "${boot_enc_key_size}")
       endif()
 
-      align_up(${key_size} ${write_size} key_size)
+      align_up(${key_size} ${max_align_size} key_size)
       math(EXPR key_size "${key_size} * 2")
     endif()
 
@@ -488,11 +581,15 @@ if(SYSBUILD)
     if(CONFIG_SINGLE_APPLICATION_SLOT OR CONFIG_BOOT_FIRMWARE_LOADER)
       set(boot_swap_data_size 0)
     else()
-      math(EXPR boot_swap_data_size "${write_size} * 4")
+      math(EXPR boot_swap_data_size "${max_align_size} * 4")
     endif()
 
     if(CONFIG_BOOT_SWAP_USING_SCRATCH OR CONFIG_BOOT_SWAP_USING_MOVE)
-      math(EXPR boot_status_data_size "${CONFIG_BOOT_MAX_IMG_SECTORS} * (3 * ${write_size})")
+      if(CONFIG_BOOT_MAX_IMG_SECTORS_AUTO AND DEFINED slot_min_sectors AND "${slot_min_sectors}" GREATER "0")
+        math(EXPR boot_status_data_size "${slot_min_sectors} * (3 * ${write_size})")
+      else()
+        math(EXPR boot_status_data_size "${CONFIG_BOOT_MAX_IMG_SECTORS} * (3 * ${write_size})")
+      endif()
     else()
       set(boot_status_data_size 0)
     endif()

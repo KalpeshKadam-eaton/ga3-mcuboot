@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Nordic Semiconductor ASA
+ * Copyright (c) 2023-2024 Nordic Semiconductor ASA
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -7,7 +7,13 @@
 #if USE_PARTITION_MANAGER
 /* Blocking the rest of the file */
 #define __SYSFLASH_H__
+#if CONFIG_MCUBOOT_APPLICATION_IMAGE_NUMBER != -1
+/* Sysbuild */
 #include <sysflash/pm_sysflash.h>
+#else
+/* Legacy child/parent */
+#include <sysflash/pm_sysflash_legacy_child_parent.h>
+#endif
 #endif
 
 #ifndef __SYSFLASH_H__
@@ -17,6 +23,14 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/storage/flash_map.h>
 #include <zephyr/sys/util_macro.h>
+
+#ifndef SOC_FLASH_0_ID
+#define SOC_FLASH_0_ID 0
+#endif
+
+#ifndef SPI_FLASH_0_ID
+#define SPI_FLASH_0_ID 1
+#endif
 
 #if !defined(CONFIG_SINGLE_APPLICATION_SLOT) && !defined(CONFIG_MCUBOOT_BOOTLOADER_MODE_SINGLE_APP)
 
