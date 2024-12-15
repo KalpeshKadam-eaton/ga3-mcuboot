@@ -105,7 +105,7 @@ static bool owner_nsib[BOOT_IMAGE_NUMBER] = {false};
 
 #define NO_ACTIVE_SLOT UINT32_MAX
 
-static int
+int
 boot_read_image_headers(struct boot_loader_state *state, bool require_all,
         struct boot_status *bs)
 {
@@ -803,7 +803,7 @@ boot_write_status(const struct boot_loader_state *state, struct boot_status *bs)
 /*
  * Validate image hash/signature and optionally the security counter in a slot.
  */
-static fih_ret
+fih_ret
 boot_image_check(struct boot_loader_state *state, struct image_header *hdr,
                  const struct flash_area *fap, struct boot_status *bs)
 {
@@ -915,7 +915,7 @@ boot_data_is_set_to(uint8_t val, void *data, size_t len)
     return true;
 }
 
-static int
+int
 boot_check_header_erased(struct boot_loader_state *state, int slot)
 {
     const struct flash_area *fap;

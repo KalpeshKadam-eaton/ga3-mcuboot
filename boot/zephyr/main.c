@@ -427,6 +427,9 @@ static void boot_serial_enter()
 {
     int rc;
 
+#if !defined(CONFIG_SERVER_SIGNING)
+BOOT_LOG_WRN("***** Warning : Currently local signing is used which is not recommended for production. Enable server signing *****");
+#endif
 #ifdef CONFIG_MCUBOOT_INDICATION_LED
     io_led_set(1);
 #endif

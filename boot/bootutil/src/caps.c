@@ -81,7 +81,9 @@ uint32_t bootutil_get_caps(void)
 #if defined(MCUBOOT_HW_ROLLBACK_PROT)
     res |= BOOTUTIL_CAP_HW_ROLLBACK_PROT;
 #endif
-
+#if defined(MCUBOOT_X509)
+    res |= BOOTUTIL_CAP_X509;
+#endif
     return res;
 }
 

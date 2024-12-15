@@ -37,6 +37,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.exceptions import InvalidSignature
+from imgtool.Server_Sign import server_sign_image
 
 IMAGE_MAGIC = 0x96f3b83d
 IMAGE_HEADER_SIZE = 32
@@ -61,6 +62,7 @@ IMAGE_F = {
 TLV_VALUES = {
         'KEYHASH': 0x01,
         'PUBKEY': 0x02,
+        'X509': 0x03,
         'SHA256': 0x10,
         'SHA384': 0x11,
         'RSA2048': 0x20,
@@ -315,9 +317,9 @@ class Image():
                 format=PublicFormat.Raw)
         return cipherkey, ciphermac, pubk
 
-    def create(self, key, public_key_format, enckey, dependencies=None,
+    def create(self, public_key_format, enckey, user_name, user_pwd, outfile=None, certificates=None, dependencies=None,
                sw_type=None, custom_tlvs=None, encrypt_keylen=128, clear=False,
-               fixed_sig=None, pub_key=None, vector_to_sign=None):
+               fixed_sig=None, pub_key=None, vector_to_sign=None, key=None, hex_addr=None):
         self.enckey = enckey
 
         # Check what hashing algorithm should be used
@@ -455,6 +457,12 @@ class Image():
         digest = sha.digest()
         tlv.add(hash_tlv, digest)
 
+	# add certificates value as TLV
+        if certificates is not None:
+            # Certificates dictionary contain Tag value field inside value part. 
+            for index, value in certificates.items():
+                tlv.add('X509', value)
+
         if vector_to_sign == 'payload':
             # Stop amending data to the image
             # Just keep data vector which is expected to be signed
@@ -489,7 +497,15 @@ class Image():
                 self.signature = fixed_sig['value']
             else:
                 raise click.UsageError("Can not sign using key and provide fixed-signature at the same time")
-
+        else:
+            dir_path = os.path.dirname(os.path.realpath(__file__))
+            outfile_bin_path=os.path.realpath(os.path.join(outfile,'..','zephyr.tmp.unusigned.bin'))
+            self.save(outfile_bin_path,hex_addr)
+            server_sign_image.eaton_server_sign(outfile_bin_path, user_name, user_pwd)
+            outfile_sig_path = os.path.realpath(os.path.join(outfile_bin_path,'..','zephyr.tmp.signed.bin.p7b.sig'))
+            file = open(outfile_sig_path, 'rb') 
+            sig = file.read()
+            tlv.add('ECDSASIG',sig)
         # At this point the image was hashed + signed, we can remove the
         # protected TLVs from the payload (will be re-added later)
         if protected_tlv_off is not None:

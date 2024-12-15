@@ -73,6 +73,15 @@ keygens = {
 }
 valid_formats = ['openssl', 'pkcs8']
 
+def load_cert(filename):
+    # open certificate file and read data in binary format 
+    try:
+        with open(filename, 'rb') as file:
+            value = file.read()
+    except FileNotFoundError:
+        msg = " The file " + filename + " does not exist"
+        print(msg)
+    return value
 
 def load_signature(sigfile):
     with open(sigfile, 'rb') as f:
@@ -312,6 +321,12 @@ class BasedIntParamType(click.ParamType):
 
 @click.argument('outfile')
 @click.argument('infile')
+@click.option('--user-name', required=False, nargs=1, default=None, multiple=False,
+              help='This argument will be used to provide the user name '
+                   'for server signing.')
+@click.option('--user-pwd', required=False, nargs=1, default=None, multiple=False,
+              help='This argument will be used to provide the user password '
+                   'for server signing.')
 @click.option('--custom-tlv', required=False, nargs=2, default=[],
               multiple=True, metavar='[tag] [value]',
               help='Custom TLV that will be placed into protected area. '
@@ -380,6 +395,14 @@ class BasedIntParamType(click.ParamType):
               default='1',
               required=False,
               help='Alignment used by swap update modes.')
+@click.option('--cert', required=False, nargs=1, default=[], multiple=True,
+              metavar='[filename]',
+              help='This argument will be used to provide the certificate file '
+                   'path. Specify the option 2 times to add Intermediate and '
+                   'Product certificates. Certificate need to be pass in sequence '
+                   'i.e 1st Intermediate and 2nd Product certificate. Root '
+                   'Certificate not required to pass as argument. It should be part of '
+                   'bootloader. Certificate TLV will hold the "X509" i.e 0x03 as tag value.')
 @click.option('--max-align', type=click.Choice(['8', '16', '32']),
               required=False,
               help='Maximum flash alignment. Set if flash alignment of the '
@@ -404,13 +427,12 @@ class BasedIntParamType(click.ParamType):
 @click.command(help='''Create a signed or unsigned image\n
                INFILE and OUTFILE are parsed as Intel HEX if the params have
                .hex extension, otherwise binary format is used''')
-def sign(key, public_key_format, align, version, pad_sig, header_size,
+def sign(key, public_key_format, cert, align, version, pad_sig, header_size,
          pad_header, slot_size, pad, confirm, max_sectors, overwrite_only,
          endian, encrypt_keylen, encrypt, infile, outfile, dependencies,
          load_addr, hex_addr, erased_val, save_enctlv, security_counter,
          boot_record, custom_tlv, rom_fixed, max_align, clear, fix_sig,
-         fix_sig_pubkey, sig_out, vector_to_sign):
-
+         fix_sig_pubkey, sig_out, vector_to_sign, user_name, user_pwd):
     if confirm:
         # Confirmed but non-padded images don't make much sense, because
         # otherwise there's no trailer area for writing the confirmed status.
@@ -457,6 +479,12 @@ def sign(key, public_key_format, align, version, pad_sig, header_size,
         else:
             custom_tlvs[tag] = value.encode('utf-8')
 
+    # Get list of certificates from the command-line
+    index = 0
+    certificates = {}
+    for filepath in cert:
+        certificates[index] = load_cert(filepath)
+        index += 1
     # Allow signature calculated externally.
     raw_signature = load_signature(fix_sig) if fix_sig else None
 
@@ -474,9 +502,9 @@ def sign(key, public_key_format, align, version, pad_sig, header_size,
             'value': raw_signature
         }
 
-    img.create(key, public_key_format, enckey, dependencies, boot_record,
+    img.create( public_key_format, enckey, user_name, user_pwd, outfile, certificates, dependencies, boot_record,
                custom_tlvs, int(encrypt_keylen), clear, baked_signature,
-               pub_key, vector_to_sign)
+               pub_key, vector_to_sign, key, hex_addr)
     img.save(outfile, hex_addr)
 
     if sig_out is not None:
